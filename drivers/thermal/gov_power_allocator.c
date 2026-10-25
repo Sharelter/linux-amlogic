@@ -505,6 +505,23 @@ unlock:
 	return ret;
 }
 
+static bool trip_has_power_actor(struct thermal_zone_device *tz, int trip)
+{
+	struct thermal_instance *instance;
+	bool found = false;
+
+	mutex_lock(&tz->lock);
+	list_for_each_entry(instance, &tz->thermal_instances, tz_node) {
+		if (instance->trip == trip && cdev_is_power_actor(instance->cdev)) {
+			found = true;
+			break;
+		}
+	}
+	mutex_unlock(&tz->lock);
+
+	return found;
+}
+
 /**
  * get_governor_trips() - get the number of the two trip points that are key for this governor
  * @tz:	thermal zone to operate on
@@ -623,6 +640,12 @@ static int check_power_actors(struct thermal_zone_device *tz)
 
 	list_for_each_entry(instance, &tz->thermal_instances, tz_node) {
 		if (!cdev_is_power_actor(instance->cdev)) {
+			enum thermal_trip_type type;
+
+			if (!tz->ops->get_trip_type(tz, instance->trip, &type) &&
+			    type == THERMAL_TRIP_ACTIVE)
+				continue;
+
 			dev_warn(&tz->device, "power_allocator: %s is not a power actor\n",
 				 instance->cdev->type);
 			ret = -EINVAL;
@@ -708,6 +731,54 @@ static void power_allocator_unbind(struct thermal_zone_device *tz)
 	tz->governor_data = NULL;
 }
 
+/* Active cooling devices do not participate in the power budget. */
+static int power_allocator_active_throttle(struct thermal_zone_device *tz,
+					   int trip)
+{
+	struct thermal_instance *instance;
+	int trip_temp, trip_hyst, ret;
+	unsigned long state;
+
+	ret = tz->ops->get_trip_temp(tz, trip, &trip_temp);
+	if (ret)
+		return ret;
+	trip_hyst = 0;
+	if (tz->ops->get_trip_hyst) {
+		ret = tz->ops->get_trip_hyst(tz, trip, &trip_hyst);
+		if (ret)
+			return ret;
+	}
+
+	mutex_lock(&tz->lock);
+	list_for_each_entry(instance, &tz->thermal_instances, tz_node) {
+		struct thermal_cooling_device *cdev = instance->cdev;
+
+		if (instance->trip != trip || cdev_is_power_actor(cdev))
+			continue;
+
+		if (instance->target == THERMAL_NO_TARGET) {
+			ret = cdev->ops->get_cur_state(cdev, &state);
+			if (ret)
+				continue;
+			instance->target = clamp_val(state, instance->lower,
+						     instance->upper);
+		}
+
+		if (tz->temperature >= trip_temp)
+			instance->target = instance->upper;
+		else if (tz->temperature <= trip_temp - trip_hyst)
+			instance->target = instance->lower;
+
+		mutex_lock(&cdev->lock);
+		cdev->updated = false;
+		mutex_unlock(&cdev->lock);
+		thermal_cdev_update(cdev);
+	}
+	mutex_unlock(&tz->lock);
+
+	return 0;
+}
+
 static int power_allocator_throttle(struct thermal_zone_device *tz, int trip)
 {
 	int ret;
@@ -716,6 +787,19 @@ static int power_allocator_throttle(struct thermal_zone_device *tz, int trip)
 	bool update;
 	bool enable = true;
 	bool override = false;
+	enum thermal_trip_type type;
+
+	ret = tz->ops->get_trip_type(tz, trip, &type);
+	if (ret)
+		return ret;
+	if (type == THERMAL_TRIP_ACTIVE) {
+		ret = power_allocator_active_throttle(tz, trip);
+		if (ret)
+			dev_warn_ratelimited(&tz->device,
+					     "Failed to update active cooling: %d\n", ret);
+		if (!trip_has_power_actor(tz, trip))
+			return ret;
+	}
 
 	/*
 	 * We get called for every trip point but we only need to do
